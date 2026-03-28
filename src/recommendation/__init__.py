@@ -1,1 +1,2 @@
-# Recommendation module
+"""Slot recommendation package."""
+
