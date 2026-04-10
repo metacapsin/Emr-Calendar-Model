@@ -1,0 +1,42 @@
+app:
+  title: "Healthcare Slot Recommendation API"
+  version: "1.0.0"
+  debug: false
+
+model_path: "models/slot_prediction_model.pkl"
+
+database:
+  # URI is loaded from .env (MONGO_URI) — do not hardcode here
+  db_name: "admin"          # override with MONGO_DB_NAME in .env
+
+  # MongoDB collection names — change these to match your real collections
+  collections:
+    patients: "patients"
+    providers: "providers"
+    appointments: "appointments"
+    provider_schedules: "provider_schedules"
+    slot_statistics: "slot_statistics"
+
+slot_recommendation:
+  search_start_days: 1
+  search_days: 14
+  top_k: 5
+  slot_duration_minutes: 60
+  slot_step_minutes: 60
+  working_hours:
+    start: 8
+    end: 17
+  cost_fn: 1000
+  cost_fp: 200
+  min_probability: 0.0
+
+ranking:
+  weights:
+    probability: 0.6
+    preference_score: 0.25
+    utilization_penalty: 0.15
+  unique_per_day: false
+
+logging:
+  level: "INFO"
+  format: "json"

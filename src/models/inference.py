@@ -1,44 +1,55 @@
-import joblib
 from pathlib import Path
 from typing import Any, Dict, List
 
+import joblib
 import pandas as pd
+
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class SlotInferenceEngine:
     def __init__(self, model_path: str):
         self.model_path = Path(model_path)
         if not self.model_path.exists():
-            raise FileNotFoundError(f"Model path not found: {model_path}")
+            raise FileNotFoundError(f"Model not found: {model_path}")
 
         bundle = joblib.load(str(self.model_path))
-        self.model = bundle.get('model')
-        self.feature_columns = bundle.get('feature_columns', [])
+        self.model = bundle.get("model")
+        self.feature_columns: List[str] = bundle.get("feature_columns", [])
+        self.model_name: str = bundle.get("model_name", "unknown")
 
         if self.model is None or not self.feature_columns:
-            raise ValueError('Invalid model bundle format.')
+            raise ValueError("Invalid model bundle: missing 'model' or 'feature_columns'")
 
-    def _validate_input(self, features: pd.DataFrame) -> pd.DataFrame:
-        missing_cols = [c for c in self.feature_columns if c not in features.columns]
-        if missing_cols:
-            raise ValueError(f"Missing required feature columns: {missing_cols}")
+        logger.info("Model loaded: name=%s features=%d", self.model_name, len(self.feature_columns))
 
-        return features[self.feature_columns].astype(float)
+    def _prepare(self, features: pd.DataFrame) -> pd.DataFrame:
+        missing = [c for c in self.feature_columns if c not in features.columns]
+        if missing:
+            raise ValueError(f"Missing feature columns: {missing}")
+        return features[self.feature_columns].fillna(0.0).astype(float)
 
     def predict_proba(self, features: pd.DataFrame) -> List[List[float]]:
-        df_valid = self._validate_input(features.copy())
-        proba = self.model.predict_proba(df_valid)
-        return proba.tolist()
+        df = self._prepare(features.copy())
+        try:
+            proba = self.model.predict_proba(df)
+            return proba.tolist()
+        except Exception as exc:
+            logger.error("predict_proba failed: %s", exc)
+            raise
 
     def predict(self, features: pd.DataFrame) -> List[int]:
-        df_valid = self._validate_input(features.copy())
-        preds = self.model.predict(df_valid)
-        return preds.tolist()
+        df = self._prepare(features.copy())
+        return self.model.predict(df).tolist()
 
     def batch_predict(self, feature_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not feature_rows:
+            return []
         df = pd.DataFrame(feature_rows)
         proba = self.predict_proba(df)
-        results = []
-        for i, row in df.iterrows():
-            results.append({'index': int(i), 'prob': float(proba[i][1]), 'prob_negative': float(proba[i][0])})
-        return results
+        return [
+            {"index": i, "prob": float(p[1]), "prob_negative": float(p[0])}
+            for i, p in enumerate(proba)
+        ]
