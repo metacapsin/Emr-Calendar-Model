@@ -4,7 +4,7 @@ from pprint import pprint
 # =========================
 # CONFIG
 # =========================
-MONGO_URI = "mongodb+srv://emr_prod_admin:WpLVJEB3n4HiusZL@emr-prod.pdvpfr.mongodb.net/dev"
+MONGO_URI = "mongodb+srv://SJ:WpLVJ7SHSUSAMAJSISSSEB3n4HiusZL@emr-prod.SHSSHNSHS.mongodb.net/dev"
 DB_NAME = "dev"
 
 print("\n🚀 Connecting to MongoDB...\n")
