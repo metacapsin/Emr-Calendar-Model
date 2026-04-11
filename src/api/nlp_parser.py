@@ -48,6 +48,8 @@ def parse_appointment_request(text: str) -> Dict[str, Optional[Any]]:
         "provider_encoded": None,
         "date": None,
         "raw_text": text,
+        "patient_name": None,
+        "provider_name": None,
     }
 
     normalized = text.lower().strip()
@@ -93,7 +95,16 @@ def parse_appointment_request(text: str) -> Dict[str, Optional[Any]]:
         if raw.isdigit():
             out["provider_encoded"] = int(raw)
         else:
-            # Named provider — store name for lookup; encoded resolved later
             out["provider_name"] = raw.title()
+
+    # ── Patient name extraction ────────────────────────────────────────────────────────────
+    # Handles: "of EMMA GAMEZ", "for John Doe", "patient Jane Smith"
+    # Works on both original case and normalized text
+    patient_match = re.search(
+        r"(?:of|for|patient)\s+([A-Za-z][A-Za-z\s]{1,40}?)(?:\s+(?:for|with|next|on|tomorrow|today|morning|afternoon|evening|night)|$)",
+        text.strip(),
+    )
+    if patient_match:
+        out["patient_name"] = " ".join(patient_match.group(1).strip().split()).title()
 
     return out

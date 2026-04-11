@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from bson import ObjectId
 from pymongo.database import Database
 
 from src.database.db_connection import get_collection_names
@@ -15,32 +16,51 @@ def _cols(db: Database) -> dict:
     return get_collection_names()
 
 
+def _to_oid(id_str: str) -> Optional[ObjectId]:
+    try:
+        return ObjectId(id_str)
+    except Exception:
+        return None
+
+
 # ─── Patient ──────────────────────────────────────────────────────────────────
 
-def get_patient_data(db: Database, patient_encoded: int) -> Dict[str, Any]:
+def get_patient_data(db: Database, patient_id: str) -> Dict[str, Any]:
+    """
+    Fetch patient data by MongoDB _id (string).
+    Returns ML-compatible feature dict with safe defaults if not found.
+    """
     col = _cols(db)
-    patient = db[col["patients"]].find_one({"patient_encoded": patient_encoded})
+    oid = _to_oid(patient_id)
+
+    patient = db[col["patients"]].find_one({"_id": oid}) if oid else None
 
     if not patient:
-        logger.warning("Patient not found: %s — using defaults", patient_encoded)
-        return _default_patient(patient_encoded)
+        logger.warning("[get_patient_data] not found: id=%s — using defaults", patient_id)
+        return _default_patient(patient_id)
 
-    now = datetime.utcnow()
+    now       = datetime.utcnow()
     window_7  = now - timedelta(days=7)
     window_30 = now - timedelta(days=30)
 
-    appts = list(db[col["appointments"]].find({"patient_encoded": patient_encoded}))
+    # Appointments linked by patient _id string
+    appts     = list(db[col["appointments"]].find({"patient_id": patient_id}))
     total     = len(appts)
     confirmed = [a for a in appts if str(a.get("status", "")).strip() in CONFIRMED_STATUSES]
-
-    appts_7d   = [a for a in appts if _parse_date(a.get("appt_date")) >= window_7]
-    appts_30d  = [a for a in appts if _parse_date(a.get("appt_date")) >= window_30]
+    appts_7d  = [a for a in appts if _parse_date(a.get("appt_date")) >= window_7]
+    appts_30d = [a for a in appts if _parse_date(a.get("appt_date")) >= window_30]
     cancel_7d  = [a for a in appts_7d  if str(a.get("status", "")).strip() not in CONFIRMED_STATUSES]
     cancel_30d = [a for a in appts_30d if str(a.get("status", "")).strip() not in CONFIRMED_STATUSES]
 
     success_rate = len(confirmed) / max(1, total)
 
+    # patient_encoded: use whatever numeric ID exists in doc, fallback to hash
+    patient_encoded = _extract_numeric_id(patient, ["patient_encoded", "patientId", "patientID"])
+    if patient_encoded is None:
+        patient_encoded = _stable_hash(patient_id)
+
     return {
+        "patient_id":                 patient_id,
         "patient_encoded":            patient_encoded,
         "patient_age":                patient.get("age", patient.get("patient_age", 35)),
         "sex_encoded":                patient.get("sex_encoded", 1),
@@ -52,18 +72,19 @@ def get_patient_data(db: Database, patient_encoded: int) -> Dict[str, Any]:
         "patient_30day_cancel":       len(cancel_30d),
         "patient_hist_success_rate":  round(success_rate, 4),
         "patient_hist_appt_count":    total,
-        "has_primary_insurance":      int(patient.get("has_primary_insurance", True)),
-        "has_secondary_insurance":    int(patient.get("has_secondary_insurance", False)),
-        "is_medicare":                int(patient.get("is_medicare", False)),
-        "is_medicaid":                int(patient.get("is_medicaid", False)),
-        "is_hmo":                     int(patient.get("is_hmo", False)),
+        "has_primary_insurance":      int(bool(patient.get("has_primary_insurance", True))),
+        "has_secondary_insurance":    int(bool(patient.get("has_secondary_insurance", False))),
+        "is_medicare":                int(bool(patient.get("is_medicare", False))),
+        "is_medicaid":                int(bool(patient.get("is_medicaid", False))),
+        "is_hmo":                     int(bool(patient.get("is_hmo", False))),
         "patient_avg_copay":          float(patient.get("patient_avg_copay", 0.0)),
     }
 
 
-def _default_patient(patient_encoded: int) -> Dict[str, Any]:
+def _default_patient(patient_id: str) -> Dict[str, Any]:
     return {
-        "patient_encoded":            patient_encoded,
+        "patient_id":                 patient_id,
+        "patient_encoded":            _stable_hash(patient_id),
         "patient_age":                35,
         "sex_encoded":                1,
         "patient_total_appts":        1,
@@ -85,39 +106,53 @@ def _default_patient(patient_encoded: int) -> Dict[str, Any]:
 
 # ─── Provider ─────────────────────────────────────────────────────────────────
 
-def get_provider_data(db: Database, provider_encoded: int) -> Dict[str, Any]:
+def get_provider_data(db: Database, provider_id: str) -> Dict[str, Any]:
+    """
+    Fetch provider data by MongoDB _id (string).
+    Returns ML-compatible feature dict with safe defaults if not found.
+    """
     col = _cols(db)
-    provider = db[col["providers"]].find_one({"provider_encoded": provider_encoded})
+    oid = _to_oid(provider_id)
+
+    provider = db[col["providers"]].find_one({"_id": oid}) if oid else None
 
     if not provider:
-        logger.warning("Provider not found: %s — using defaults", provider_encoded)
-        return _default_provider(provider_encoded)
+        logger.warning("[get_provider_data] not found: id=%s — using defaults", provider_id)
+        return _default_provider(provider_id)
 
-    now = datetime.utcnow()
+    now       = datetime.utcnow()
     window_7  = now - timedelta(days=7)
     window_30 = now - timedelta(days=30)
 
-    appts = list(db[col["appointments"]].find({"provider_encoded": provider_encoded}))
+    appts     = list(db[col["appointments"]].find({"provider_id": provider_id}))
     total     = len(appts)
     confirmed = [a for a in appts if str(a.get("status", "")).strip() in CONFIRMED_STATUSES]
     appts_7d  = [a for a in appts if _parse_date(a.get("appt_date")) >= window_7]
     appts_30d = [a for a in appts if _parse_date(a.get("appt_date")) >= window_30]
 
-    max_daily = int(provider.get("max_daily_slots", 16))
-    util_7d   = len(appts_7d)  / max(1, max_daily * 7)
-    util_30d  = len(appts_30d) / max(1, max_daily * 30)
+    max_daily    = int(provider.get("max_daily_slots", 16))
+    util_7d      = len(appts_7d)  / max(1, max_daily * 7)
+    util_30d     = len(appts_30d) / max(1, max_daily * 30)
     success_rate = len(confirmed) / max(1, total)
 
-    # working_days stored as list [0,1,2,3,4] or CSV string "0,1,2,3,4"
     raw_days = provider.get("working_days", [0, 1, 2, 3, 4])
     if isinstance(raw_days, str):
         working_days = [int(d) for d in raw_days.split(",") if d.strip().isdigit()]
     else:
         working_days = [int(d) for d in raw_days]
 
+    provider_encoded = _extract_numeric_id(provider, ["provider_encoded", "providerId", "providerID"])
+    if provider_encoded is None:
+        provider_encoded = _stable_hash(provider_id)
+
+    first = provider.get("firstName", "")
+    last  = provider.get("lastName", "")
+    name  = f"{first} {last}".strip() or f"Provider {provider_id[:8]}"
+
     return {
+        "provider_id":                provider_id,
         "provider_encoded":           provider_encoded,
-        "provider_name":              provider.get("name", f"Dr {provider_encoded}"),
+        "provider_name":              name,
         "provider_total_appts":       total,
         "provider_avg_duration":      int(provider.get("avg_duration_minutes", provider.get("provider_avg_duration", 30))),
         "provider_cancel_rate":       round(1 - success_rate, 4),
@@ -133,10 +168,11 @@ def get_provider_data(db: Database, provider_encoded: int) -> Dict[str, Any]:
     }
 
 
-def _default_provider(provider_encoded: int) -> Dict[str, Any]:
+def _default_provider(provider_id: str) -> Dict[str, Any]:
     return {
-        "provider_encoded":           provider_encoded,
-        "provider_name":              f"Dr {provider_encoded}",
+        "provider_id":                provider_id,
+        "provider_encoded":           _stable_hash(provider_id),
+        "provider_name":              f"Provider {provider_id[:8]}",
         "provider_total_appts":       1,
         "provider_avg_duration":      30,
         "provider_cancel_rate":       0.0,
@@ -149,32 +185,32 @@ def _default_provider(provider_encoded: int) -> Dict[str, Any]:
     }
 
 
-def get_provider_schedule(db: Database, provider_encoded: int) -> List[str]:
+def get_provider_schedule(db: Database, provider_id: str) -> List[str]:
     """Return list of blocked ISO date strings for a provider."""
-    col = _cols(db)
-    docs = db[col["provider_schedules"]].find({"provider_encoded": provider_encoded})
+    col  = _cols(db)
+    docs = db[col["provider_schedules"]].find({"provider_id": provider_id})
     return [d["blocked_date"] for d in docs if "blocked_date" in d]
 
 
-def get_booked_slots(db: Database, provider_encoded: int, date_iso: str) -> List[int]:
-    """Return list of already-booked hours for a provider on a given date."""
-    col = _cols(db)
+def get_booked_slots(db: Database, provider_id: str, date_iso: str) -> List[int]:
+    """Return already-booked hours for a provider on a given date."""
+    col  = _cols(db)
     docs = db[col["appointments"]].find({
-        "provider_encoded": provider_encoded,
-        "appt_date":        date_iso,
-        "status":           {"$in": ["Confirmed", "Confirmed           ", "Confirmation Pending"]},
+        "provider_id": provider_id,
+        "appt_date":   date_iso,
+        "status":      {"$in": ["Confirmed", "Confirmed           ", "Confirmation Pending"]},
     })
     return [int(d["appt_hour"]) for d in docs if "appt_hour" in d]
 
 
 # ─── Slot Statistics ──────────────────────────────────────────────────────────
 
-def get_slot_statistics(db: Database, provider_encoded: int, weekday: int, hour: int) -> Dict[str, Any]:
-    col = _cols(db)
+def get_slot_statistics(db: Database, provider_id: str, weekday: int, hour: int) -> Dict[str, Any]:
+    col  = _cols(db)
     stat = db[col["slot_statistics"]].find_one({
-        "provider_encoded": provider_encoded,
-        "weekday":          weekday,
-        "hour":             hour,
+        "provider_id": provider_id,
+        "weekday":     weekday,
+        "hour":        hour,
     })
     if not stat:
         return {"success_rate": 0.5, "popularity_score": 0.0, "total_count": 0}
@@ -189,8 +225,8 @@ def get_slot_statistics(db: Database, provider_encoded: int, weekday: int, hour:
 
 def insert_appointment(
     db: Database,
-    patient_encoded: int,
-    provider_encoded: int,
+    patient_id: str,
+    provider_id: str,
     appt_date: str,
     appt_hour: int,
     duration_minutes: int = 60,
@@ -200,8 +236,8 @@ def insert_appointment(
 ) -> Dict[str, Any]:
     col = _cols(db)
     doc = {
-        "patient_encoded":  patient_encoded,
-        "provider_encoded": provider_encoded,
+        "patient_id":       patient_id,
+        "provider_id":      provider_id,
         "appt_date":        appt_date,
         "appt_hour":        appt_hour,
         "duration_minutes": duration_minutes,
@@ -212,25 +248,19 @@ def insert_appointment(
         "created_at":       datetime.utcnow(),
         "updated_at":       datetime.utcnow(),
     }
-    result = db[col["appointments"]].insert_one(doc)
+    result    = db[col["appointments"]].insert_one(doc)
     doc["_id"] = str(result.inserted_id)
-
-    logger.info(
-        "Appointment booked: id=%s patient=%s provider=%s date=%s hour=%s",
-        doc["_id"], patient_encoded, provider_encoded, appt_date, appt_hour,
-    )
+    logger.info("Appointment booked: id=%s patient=%s provider=%s date=%s hour=%s",
+                doc["_id"], patient_id, provider_id, appt_date, appt_hour)
     return doc
 
 
 def update_appointment_status(db: Database, appointment_id: str, status: str) -> Optional[Dict[str, Any]]:
-    from bson import ObjectId
     col = _cols(db)
-    try:
-        oid = ObjectId(appointment_id)
-    except Exception:
+    oid = _to_oid(appointment_id)
+    if not oid:
         logger.warning("Invalid appointment_id: %s", appointment_id)
         return None
-
     result = db[col["appointments"]].find_one_and_update(
         {"_id": oid},
         {"$set": {"status": status, "updated_at": datetime.utcnow()}},
@@ -241,12 +271,9 @@ def update_appointment_status(db: Database, appointment_id: str, status: str) ->
     return result
 
 
-def get_patient_appointments(db: Database, patient_encoded: int) -> List[Dict[str, Any]]:
-    col = _cols(db)
-    docs = db[col["appointments"]].find(
-        {"patient_encoded": patient_encoded},
-        sort=[("appt_date", -1)],
-    )
+def get_patient_appointments(db: Database, patient_id: str) -> List[Dict[str, Any]]:
+    col  = _cols(db)
+    docs = db[col["appointments"]].find({"patient_id": patient_id}, sort=[("appt_date", -1)])
     return [
         {
             "id":               str(d.get("_id", "")),
@@ -261,20 +288,16 @@ def get_patient_appointments(db: Database, patient_encoded: int) -> List[Dict[st
     ]
 
 
-def get_provider_appointments(db: Database, provider_encoded: int, date_iso: Optional[str] = None) -> List[Dict[str, Any]]:
-    col = _cols(db)
-    query: Dict[str, Any] = {"provider_encoded": provider_encoded}
+def get_provider_appointments(db: Database, provider_id: str, date_iso: Optional[str] = None) -> List[Dict[str, Any]]:
+    col   = _cols(db)
+    query: Dict[str, Any] = {"provider_id": provider_id}
     if date_iso:
         query["appt_date"] = date_iso
-
-    docs = db[col["appointments"]].find(
-        query,
-        sort=[("appt_date", 1), ("appt_hour", 1)],
-    )
+    docs = db[col["appointments"]].find(query, sort=[("appt_date", 1), ("appt_hour", 1)])
     return [
         {
             "id":               str(d.get("_id", "")),
-            "patient_encoded":  d.get("patient_encoded"),
+            "patient_id":       d.get("patient_id"),
             "appt_date":        d.get("appt_date", ""),
             "appt_hour":        d.get("appt_hour", 0),
             "status":           str(d.get("status", "")).strip(),
@@ -284,10 +307,9 @@ def get_provider_appointments(db: Database, provider_encoded: int, date_iso: Opt
     ]
 
 
-# ─── Helper ───────────────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _parse_date(value: Any) -> datetime:
-    """Safely parse appt_date — handles str ISO, datetime, or None."""
     if isinstance(value, datetime):
         return value
     if isinstance(value, str):
@@ -296,3 +318,29 @@ def _parse_date(value: Any) -> datetime:
         except ValueError:
             pass
     return datetime.min
+
+
+def _extract_numeric_id(doc: dict, fields: list) -> Optional[int]:
+    """Try multiple field names (flat + nested under 'data') for a numeric ID."""
+    for field in fields:
+        val = doc.get(field)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+    nested = doc.get("data", {})
+    if isinstance(nested, dict):
+        for field in fields:
+            val = nested.get(field)
+            if val is not None:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    pass
+    return None
+
+
+def _stable_hash(id_str: str) -> int:
+    """Deterministic small positive int from a string — used as ML feature fallback."""
+    return abs(hash(id_str)) % 100_000

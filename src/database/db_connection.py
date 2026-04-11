@@ -41,7 +41,6 @@ def get_client() -> MongoClient:
     global _client
     if _client is None:
         uri = get_mongo_uri()
-        print(f"Connecting to MongoDB at {uri}...")
         _client = MongoClient(uri, serverSelectionTimeoutMS=10000)
     return _client
 

@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from src.recommendation.recommender import AppointmentRecommender
 from src.utils.logger import get_logger
@@ -22,7 +22,7 @@ def recommend(
     patient_data: Dict[str, Any],
     provider_data: Dict[str, Any],
     top_k: int = 5,
-    db: Optional[Session] = None,
+    db: Optional[Database] = None,
 ) -> List[Dict[str, Any]]:
     recommender = get_recommender()
     return recommender.recommend_slots(

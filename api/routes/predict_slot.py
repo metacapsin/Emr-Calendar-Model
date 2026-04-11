@@ -1,7 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from api.schemas import (
     BookAppointmentRequest,
@@ -23,29 +23,37 @@ from src.database import (
 from src.utils.logger import get_logger, log_request
 
 logger = get_logger(__name__)
-
 router = APIRouter(prefix="", tags=["slots"])
 
 
 @router.post("/recommend-slots", response_model=RecommendSlotsResponse)
-def recommend_slots(payload: RecommendSlotsRequest, db: Session = Depends(get_db)):
+def recommend_slots(payload: RecommendSlotsRequest, db: Database = Depends(get_db)):
     log_request(logger, "/recommend-slots", payload.model_dump())
     try:
-        parsed = parse_appointment_request(payload.text)
+        parsed       = parse_appointment_request(payload.text)
+        patient_dict = payload.patient_data.model_dump()
+        provider_dict = payload.provider_data.model_dump()
+
+        # Inject patient_name from NLP if not already resolved
+        if parsed.get("patient_name") and not patient_dict.get("patient_id"):
+            patient_dict["patient_name"] = parsed["patient_name"]
+
         slots = recommend(
             text=payload.text,
-            patient_data=payload.patient_data.model_dump(),
-            provider_data=payload.provider_data.model_dump(),
+            patient_data=patient_dict,
+            provider_data=provider_dict,
             top_k=payload.top_k,
             db=db,
         )
+
         items = [
             SlotItem(
                 date=s["date"],
                 time=s.get("time", f"{s['hour']:02d}:00"),
                 hour=s["hour"],
                 prob=s["prob"],
-                provider_encoded=s.get("provider_encoded"),
+                patient_id=s.get("patient_id"),
+                provider_id=s.get("provider_id"),
                 score=s.get("score"),
             )
             for s in slots
@@ -63,13 +71,13 @@ def recommend_slots(payload: RecommendSlotsRequest, db: Session = Depends(get_db
 
 
 @router.post("/book-appointment", response_model=BookAppointmentResponse)
-def book_appointment(payload: BookAppointmentRequest, db: Session = Depends(get_db)):
+def book_appointment(payload: BookAppointmentRequest, db: Database = Depends(get_db)):
     log_request(logger, "/book-appointment", payload.model_dump())
     try:
         appt = insert_appointment(
             db=db,
-            patient_encoded=payload.patient_encoded,
-            provider_encoded=payload.provider_encoded,
+            patient_id=payload.patient_id,
+            provider_id=payload.provider_id,
             appt_date=payload.appt_date,
             appt_hour=payload.appt_hour,
             duration_minutes=payload.duration_minutes,
@@ -82,8 +90,8 @@ def book_appointment(payload: BookAppointmentRequest, db: Session = Depends(get_
             status=str(appt.get("status", "")).strip(),
             appt_date=appt["appt_date"],
             appt_hour=appt["appt_hour"],
-            patient_encoded=payload.patient_encoded,
-            provider_encoded=payload.provider_encoded,
+            patient_id=payload.patient_id,
+            provider_id=payload.provider_id,
         )
     except Exception as exc:
         logger.error("book-appointment error: %s", exc)
@@ -92,23 +100,18 @@ def book_appointment(payload: BookAppointmentRequest, db: Session = Depends(get_
 
 @router.get("/provider-slots", response_model=ProviderSlotsResponse)
 def provider_slots(
-    provider_encoded: int = Query(..., ge=0),
+    provider_id: str = Query(..., description="MongoDB _id of provider"),
     date: Optional[str] = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ):
-    appts = get_provider_appointments(db, provider_encoded, date)
-    return ProviderSlotsResponse(
-        provider_encoded=provider_encoded,
-        date=date,
-        appointments=appts,
-    )
+    appts = get_provider_appointments(db, provider_id, date)
+    return ProviderSlotsResponse(provider_id=provider_id, date=date, appointments=appts)
 
 
 @router.get("/patient-history", response_model=PatientHistoryResponse)
-def patient_history(patient_encoded: int = Query(..., ge=0), db: Session = Depends(get_db)):
-    appts = get_patient_appointments(db, patient_encoded)
-    return PatientHistoryResponse(
-        patient_encoded=patient_encoded,
-        appointments=appts,
-        total=len(appts),
-    )
+def patient_history(
+    patient_id: str = Query(..., description="MongoDB _id of patient"),
+    db: Database = Depends(get_db),
+):
+    appts = get_patient_appointments(db, patient_id)
+    return PatientHistoryResponse(patient_id=patient_id, appointments=appts, total=len(appts))
