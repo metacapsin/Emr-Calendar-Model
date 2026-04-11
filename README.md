@@ -1,4 +1,4 @@
-# 🔥 EMR Slot Recommender
+# 🔥 EMR Slot Recommender Machine Learning Model
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104-black?logo=fastapi)](https://fastapi.tiangolo.com/)
