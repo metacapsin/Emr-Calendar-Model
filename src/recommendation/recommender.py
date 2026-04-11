@@ -212,42 +212,57 @@ def _lookup_patient_id(db: Database, patient_name: str) -> Optional[str]:
 
     doc: Optional[dict] = None
 
-    # Step 1 — exact match
-    for field in ("data.fullName", "fullName"):
-        q   = {field: {"$regex": f"^{re.escape(norm)}$", "$options": "i"}}
-        doc = coll.find_one(q)
-        logger.info("[patient_lookup] step1 exact  field='%s'  found=%s", field, bool(doc))
-        if doc:
-            break
+    # Step 1 — exact match on fullName (top-level)
+    q   = {"fullName": {"$regex": f"^{re.escape(norm)}$", "$options": "i"}}
+    doc = coll.find_one(q)
+    logger.info("[patient_lookup] step1 exact fullName  found=%s", bool(doc))
 
-    # Step 2 — all tokens present
+    # Step 2 — all tokens AND on fullName
     if not doc and len(tokens) >= 2:
-        for field in ("data.fullName", "fullName"):
-            q   = {"$and": [{field: {"$regex": re.escape(t), "$options": "i"}} for t in tokens]}
-            doc = coll.find_one(q)
-            logger.info("[patient_lookup] step2 all-tokens  field='%s'  found=%s", field, bool(doc))
-            if doc:
-                break
+        q   = {"$and": [{"fullName": {"$regex": re.escape(t), "$options": "i"}} for t in tokens]}
+        doc = coll.find_one(q)
+        logger.info("[patient_lookup] step2 all-tokens fullName  found=%s", bool(doc))
 
-    # Step 3 — first OR last token
+    # Step 3 — firstName + lastName separate fields (patient-details schema)
+    if not doc and len(tokens) >= 2:
+        q   = {
+            "firstName": {"$regex": re.escape(tokens[0]),  "$options": "i"},
+            "lastName":  {"$regex": re.escape(tokens[-1]), "$options": "i"},
+        }
+        doc = coll.find_one(q)
+        logger.info("[patient_lookup] step3 firstName+lastName  found=%s", bool(doc))
+
+    # Step 4 — patientFirstName + patientLastName (patient-register schema fallback)
+    if not doc and len(tokens) >= 2:
+        q   = {
+            "patientFirstName": {"$regex": re.escape(tokens[0]),  "$options": "i"},
+            "patientLastName":  {"$regex": re.escape(tokens[-1]), "$options": "i"},
+        }
+        doc = coll.find_one(q)
+        logger.info("[patient_lookup] step4 patientFirstName+patientLastName  found=%s", bool(doc))
+
+    # Step 5 — any token on fullName OR firstName OR lastName
     if not doc:
-        for field in ("data.fullName", "fullName"):
-            q   = {"$or": [
-                {field: {"$regex": re.escape(tokens[0]),  "$options": "i"}},
-                {field: {"$regex": re.escape(tokens[-1]), "$options": "i"}},
-            ]}
-            doc = coll.find_one(q)
-            logger.info("[patient_lookup] step3 partial  field='%s'  found=%s", field, bool(doc))
-            if doc:
-                break
+        q   = {"$or": [
+            {"fullName":  {"$regex": re.escape(tokens[0]),  "$options": "i"}},
+            {"fullName":  {"$regex": re.escape(tokens[-1]), "$options": "i"}},
+            {"firstName": {"$regex": re.escape(tokens[0]),  "$options": "i"}},
+            {"lastName":  {"$regex": re.escape(tokens[-1]), "$options": "i"}},
+        ]}
+        doc = coll.find_one(q)
+        logger.info("[patient_lookup] step5 partial  found=%s", bool(doc))
 
     if not doc:
         logger.warning("[patient_lookup] NO MATCH for '%s'", patient_name)
         return None
 
     _id           = str(doc["_id"])
-    resolved_name = doc.get("fullName") or doc.get("data", {}).get("fullName", "?")
-    logger.info("[patient_lookup] MATCHED  fullName='%s'  _id=%s", resolved_name, _id)
+    resolved_name = (
+        doc.get("fullName")
+        or f"{doc.get('firstName', '')} {doc.get('lastName', '')}".strip()
+        or doc.get("data", {}).get("fullName", "?")
+    )
+    logger.info("[patient_lookup] MATCHED  name='%s'  _id=%s", resolved_name, _id)
     return _id
 
 
@@ -274,44 +289,47 @@ def _lookup_provider_id(db: Database, provider_name: str) -> Optional[str]:
         logger.warning("[provider_lookup] no usable tokens from '%s'", provider_name)
         return None
 
+    # Base filter: only match users with provider role
+    role_filter = {"role": {"$in": ["provider"]}}
     doc: Optional[dict] = None
 
-    # Step 1 — firstName exact + lastName contains last token
+    # Step 1 — firstName exact + lastName contains last token (provider role only)
     if len(tokens) >= 2:
         q   = {
+            **role_filter,
             "firstName": {"$regex": f"^{re.escape(tokens[0])}$", "$options": "i"},
             "lastName":  {"$regex": re.escape(tokens[-1]),        "$options": "i"},
         }
         doc = coll.find_one(q)
         logger.info("[provider_lookup] step1 firstName+lastName  found=%s", bool(doc))
 
-    # Step 2 — any token → best match
+    # Step 2 — any token in firstName OR lastName (provider role only) → best match
     if not doc:
         or_clauses = []
         for t in tokens:
             e = re.escape(t)
             or_clauses.append({"firstName": {"$regex": e, "$options": "i"}})
             or_clauses.append({"lastName":  {"$regex": e, "$options": "i"}})
-        candidates = list(coll.find({"$or": or_clauses}))
+        candidates = list(coll.find({"$and": [role_filter, {"$or": or_clauses}]}))
         logger.info("[provider_lookup] step2 any-token  candidates=%d", len(candidates))
         doc = _best_provider_match(candidates, tokens)
         logger.info("[provider_lookup] step2 best-match  found=%s", bool(doc))
 
-    # Step 3 — first token only
+    # Step 3 — first token only (provider role)
     if not doc:
-        q   = {"$or": [
+        q   = {"$and": [role_filter, {"$or": [
             {"firstName": {"$regex": re.escape(tokens[0]), "$options": "i"}},
             {"lastName":  {"$regex": re.escape(tokens[0]), "$options": "i"}},
-        ]}
+        ]}]}
         doc = coll.find_one(q)
         logger.info("[provider_lookup] step3 first-token  found=%s", bool(doc))
 
-    # Step 4 — last token only
+    # Step 4 — last token only (provider role)
     if not doc and len(tokens) > 1:
-        q   = {"$or": [
+        q   = {"$and": [role_filter, {"$or": [
             {"firstName": {"$regex": re.escape(tokens[-1]), "$options": "i"}},
             {"lastName":  {"$regex": re.escape(tokens[-1]), "$options": "i"}},
-        ]}
+        ]}]}
         doc = coll.find_one(q)
         logger.info("[provider_lookup] step4 last-token  found=%s", bool(doc))
 

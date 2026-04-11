@@ -6,13 +6,12 @@ app:
 model_path: "models/slot_prediction_model.pkl"
 
 database:
-  # URI is loaded from .env (MONGO_URI) — do not hardcode here
-  db_name: "admin"          # override with MONGO_DB_NAME in .env
+  db_name: "dev"
 
-  # MongoDB collection names — change these to match your real collections
+  # MongoDB collection names — matched to real EMR collections
   collections:
-    patients: "patients"
-    providers: "providers"
+    patients: "patient-details"
+    providers: "users"
     appointments: "appointments"
     provider_schedules: "provider_schedules"
     slot_statistics: "slot_statistics"

@@ -26,7 +26,6 @@ def _load_config() -> dict:
 
 
 def get_mongo_uri() -> str:
-    """Read URI from .env — already percent-encoded by user."""
     uri = os.getenv("MONGO_URI")
     if not uri:
         raise RuntimeError("MONGO_URI not set in .env")
@@ -34,14 +33,13 @@ def get_mongo_uri() -> str:
 
 
 def get_db_name() -> str:
-    return os.getenv("MONGO_DB_NAME") or _load_config().get("database", {}).get("db_name", "admin")
+    return os.getenv("MONGO_DB_NAME") or _load_config().get("database", {}).get("db_name", "dev")
 
 
 def get_client() -> MongoClient:
     global _client
     if _client is None:
-        uri = get_mongo_uri()
-        _client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        _client = MongoClient(get_mongo_uri(), serverSelectionTimeoutMS=10000)
     return _client
 
 
@@ -53,11 +51,10 @@ def get_database() -> Database:
 
 
 def get_collection_names() -> dict:
-    cfg = _load_config()
-    cols = cfg.get("database", {}).get("collections", {})
+    cols = _load_config().get("database", {}).get("collections", {})
     return {
-        "patients":           cols.get("patients",           "patients"),
-        "providers":          cols.get("providers",          "providers"),
+        "patients":           cols.get("patients",           "patient-details"),
+        "providers":          cols.get("providers",          "users"),
         "appointments":       cols.get("appointments",       "appointments"),
         "provider_schedules": cols.get("provider_schedules", "provider_schedules"),
         "slot_statistics":    cols.get("slot_statistics",    "slot_statistics"),
@@ -65,47 +62,16 @@ def get_collection_names() -> dict:
 
 
 def get_db():
-    """FastAPI dependency — yields MongoDB database instance."""
+    """FastAPI dependency — yields MongoDB database instance. Read-only."""
     db = get_database()
     try:
         yield db
     finally:
-        pass  # MongoClient is a singleton — do not close per-request
+        pass
 
 
 def init_db() -> None:
-    """Verify connection and ensure indexes exist."""
-    db = get_database()
-    cols = get_collection_names()
-
-    # Patients — unique index on patient_encoded
-    db[cols["patients"]].create_index("patient_encoded", unique=True, background=True)
-
-    # Providers — unique index on provider_encoded
-    db[cols["providers"]].create_index("provider_encoded", unique=True, background=True)
-
-    # Appointments — compound index for fast provider+date lookups
-    db[cols["appointments"]].create_index(
-        [("provider_encoded", 1), ("appt_date", 1), ("appt_hour", 1)],
-        background=True,
-    )
-    db[cols["appointments"]].create_index("patient_encoded", background=True)
-
-    # Slot statistics — unique compound index
-    db[cols["slot_statistics"]].create_index(
-        [("provider_encoded", 1), ("weekday", 1), ("hour", 1)],
-        unique=True,
-        background=True,
-    )
-
-    # Provider schedules — compound index
-    db[cols["provider_schedules"]].create_index(
-        [("provider_encoded", 1), ("blocked_date", 1)],
-        unique=True,
-        background=True,
-    )
-
+    """Verify MongoDB connection only — NO writes, NO index creation."""
+    get_database().command("ping")
     from src.utils.logger import get_logger
-    get_logger(__name__).info(
-        "MongoDB connected: db=%s", get_db_name()
-    )
+    get_logger(__name__).info("MongoDB connected: db=%s", get_db_name())
