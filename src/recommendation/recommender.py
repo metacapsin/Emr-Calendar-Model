@@ -7,14 +7,17 @@ import yaml
 from pymongo.database import Database
 
 from src.api.nlp_parser import parse_appointment_request
+from src.database.errors import EntityNotFoundError
 from src.database.queries import (
     get_booked_slots,
+    get_patient_by_name,
     get_patient_data,
+    get_provider_by_name,
     get_provider_data,
     get_provider_schedule,
     get_slot_statistics,
 )
-from src.features.slot_feature_builder import build_slots_feature_dataframe
+from src.features.slot_feature_builder import build_slots_feature_dataframe, get_time_of_day
 from src.models.inference import SlotInferenceEngine
 from src.recommendation.slot_ranker import aggregate_recommendations, rank_slots
 from src.scheduling.slot_generator import generate_candidate_slots
@@ -50,31 +53,39 @@ class AppointmentRecommender:
         logger.info("NLP parsed: %s", params)
 
         # ── Resolve patient MongoDB _id ────────────────────────────────────────
-        # Priority: payload patient_id > DB name lookup
         patient_id: Optional[str] = patient_data.get("patient_id") or None
-        if not patient_id and patient_data.get("patient_name") and db is not None:
-            patient_id = _lookup_patient_id(db, patient_data["patient_name"])
+        if not patient_id and db is not None:
+            patient_name = patient_data.get("patient_name") or params.get("patient_name")
+            if patient_name:
+                patient_id = get_patient_by_name(db, patient_name)
 
         # ── Resolve provider MongoDB _id ───────────────────────────────────────
-        # Priority: payload provider_id > NLP numeric > DB name lookup
         provider_id: Optional[str] = provider_data.get("provider_id") or None
         if not provider_id and db is not None:
             nlp_provider_name = params.get("provider_name")
-            nlp_provider_num  = params.get("provider_encoded")
-            if nlp_provider_num:
+            nlp_provider_num = params.get("provider_encoded")
+            if nlp_provider_num is not None:
                 provider_id = _lookup_provider_id_by_encoded(db, int(nlp_provider_num))
-            if not provider_id and nlp_provider_name:
-                provider_id = _lookup_provider_id(db, nlp_provider_name)
+            if not provider_id:
+                provider_name = provider_data.get("provider_name") or nlp_provider_name
+                if provider_name:
+                    provider_id = get_provider_by_name(db, provider_name)
 
-        logger.info("Resolved  patient_id=%s  provider_id=%s", patient_id, provider_id)
+        if db is not None:
+            if not patient_id:
+                raise EntityNotFoundError("patient", patient_data.get("patient_name") or params.get("patient_name") or "unknown")
+            if not provider_id:
+                raise EntityNotFoundError("provider", provider_data.get("provider_name") or params.get("provider_name") or "unknown")
+
+        logger.info("Resolved patient_id=%s provider_id=%s", patient_id, provider_id)
 
         # ── DB enrichment — fetch full feature dicts by _id ───────────────────
         if db is not None:
             if patient_id:
-                db_patient  = get_patient_data(db, patient_id)
+                db_patient = get_patient_data(db, patient_id, provider_id=provider_id)
                 patient_data = {**db_patient, **patient_data}
             if provider_id:
-                db_provider  = get_provider_data(db, provider_id)
+                db_provider = get_provider_data(db, provider_id)
                 provider_data = {**db_provider, **provider_data}
 
         # Ensure _id fields are set in dicts for downstream use
@@ -144,9 +155,13 @@ class AppointmentRecommender:
                 slot["slot_historical_success_rate"] = stats["success_rate"]
                 slot["slot_popularity_score"]        = stats["popularity_score"]
                 slot["slot_demand_count"]            = stats["total_count"]
+                slot["slot_days_ahead"]              = max(0, (datetime.fromisoformat(slot["date"]).date() - now).days)
+                slot["provider_overbooking_ratio"]    = provider_data.get("provider_overbooking_ratio", min(1.0, provider_data.get("provider_total_appts", 0) / max(1.0, provider_data.get("max_daily_slots", 16) * 7.0)))
+                slot["patient_time_preference_match"] = 1.0 if get_time_of_day(slot["hour"]) == patient_data.get("patient_preferred_time", "") else 0.0
+                slot["provider_peak_hour_score"]      = 1.0 if slot["hour"] in provider_data.get("provider_peak_hours", []) else 0.0
 
         # ── Build features + predict ───────────────────────────────────────────
-        feature_df    = build_slots_feature_dataframe(
+        feature_df = build_slots_feature_dataframe(
             slots, patient_data, provider_data, self.engine.feature_columns
         )
         probabilities = self.engine.predict_proba(feature_df)
@@ -154,16 +169,20 @@ class AppointmentRecommender:
         results: List[Dict[str, Any]] = []
         for i, slot in enumerate(slots):
             results.append({
-                "date":                  slot["date"],
-                "time":                  f"{slot['hour']:02d}:00",
-                "hour":                  slot["hour"],
-                "weekday":               slot["weekday"],
-                "prob":                  round(float(probabilities[i][1]), 4),
-                "patient_id":            patient_id,
-                "provider_id":           provider_id,
-                "provider_encoded":      provider_data.get("provider_encoded"),
-                "provider_7day_util":    provider_data.get("provider_7day_util", 0.5),
-                "slot_popularity_score": slot.get("slot_popularity_score", 0.0),
+                "date":                      slot["date"],
+                "time":                      f"{slot['hour']:02d}:00",
+                "hour":                      slot["hour"],
+                "weekday":                   slot["weekday"],
+                "prob":                      round(float(probabilities[i][1]), 4),
+                "patient_id":                patient_id,
+                "provider_id":               provider_id,
+                "provider_encoded":          provider_data.get("provider_encoded"),
+                "provider_7day_util":        provider_data.get("provider_7day_util", 0.5),
+                "slot_popularity_score":     slot.get("slot_popularity_score", 0.0),
+                "patient_preference_match":  slot.get("patient_time_preference_match", 0.0),
+                "provider_overbooking_ratio": slot.get("provider_overbooking_ratio", 0.0),
+                "slot_quality_score":        slot.get("slot_quality_score", 0.0),
+                "provider_peak_hour_score":  slot.get("provider_peak_hour_score", 0.0),
             })
 
         # ── Rank ───────────────────────────────────────────────────────────────
@@ -288,6 +307,17 @@ def _lookup_provider_id(db: Database, provider_name: str) -> Optional[str]:
     if not tokens:
         logger.warning("[provider_lookup] no usable tokens from '%s'", provider_name)
         return None
+        return None
+
+
+def _lookup_provider_id_by_encoded(db: Database, provider_encoded: int) -> Optional[str]:
+    from src.database.db_connection import get_collection_names
+    coll = db[get_collection_names()["providers"]]
+    query = {"provider_encoded": provider_encoded}
+    doc = coll.find_one(query)
+    if doc:
+        return str(doc["_id"])
+    return None
 
     # Base filter: only match users with provider role
     role_filter = {"role": {"$in": ["provider"]}}

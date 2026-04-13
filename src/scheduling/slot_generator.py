@@ -1,3 +1,4 @@
+import math
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
@@ -56,9 +57,15 @@ def generate_candidate_slots(
         day_end = hours_cfg.get("end", day_end)
 
     preferred_range = TIME_OF_DAY.get(preferred_time_of_day) if preferred_time_of_day else None
+    slot_step_minutes = max(slot_step_minutes, slot_duration_minutes)
+    step_hours = max(1, math.ceil(slot_step_minutes / 60))
 
     candidate_slots: List[Dict[str, Any]] = []
     current = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    provider_utilization = 0.0
+    if provider_availability:
+        provider_utilization = float(provider_availability.get("provider_7day_util", provider_availability.get("provider_utilization", 0.0)))
 
     while current.date() <= end_date.date():
         date_iso = current.date().isoformat()
@@ -78,16 +85,31 @@ def generate_candidate_slots(
 
         while hour < day_end:
             if preferred_range and hour not in preferred_range:
-                hour += slot_step_minutes // 60 if slot_step_minutes >= 60 else 1
+                hour += step_hours
                 continue
 
-            if hour in booked_hours:
-                hour += 1
-                continue
-
-            slot_end_hour = hour + slot_duration_minutes // 60
+            slot_end_hour = hour + math.ceil(slot_duration_minutes / 60)
             if slot_end_hour > day_end:
                 break
+
+            if hour in booked_hours:
+                hour += step_hours
+                continue
+
+            if provider_utilization > 0.8 and hour not in TIME_OF_DAY["morning"] and hour not in TIME_OF_DAY["midday"]:
+                hour += step_hours
+                continue
+
+            quality = 0.4
+            if hour in TIME_OF_DAY["morning"]:
+                quality += 0.2
+            elif hour in TIME_OF_DAY["midday"]:
+                quality += 0.1
+            elif hour in TIME_OF_DAY["afternoon"]:
+                quality += 0.05
+            if weekday in (0, 4):
+                quality += 0.05
+            quality = min(1.0, quality)
 
             candidate_slots.append(
                 {
@@ -103,10 +125,12 @@ def generate_candidate_slots(
                     "provider_encoded": provider_availability.get("provider_encoded") if provider_availability else None,
                     "is_holiday": 0,
                     "is_peak_day": 1 if weekday in (0, 4) else 0,
+                    "slot_quality_score": round(quality, 3),
+                    "provider_7day_util": provider_utilization,
                 }
             )
 
-            hour += max(1, slot_step_minutes // 60)
+            hour += step_hours
 
         current += timedelta(days=1)
 

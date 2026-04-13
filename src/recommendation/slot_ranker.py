@@ -12,8 +12,16 @@ def _preference_score(slot: Dict[str, Any], preferred_time: Optional[str]) -> fl
 
 def _utilization_penalty(slot: Dict[str, Any]) -> float:
     """Penalize over-utilized providers (0–1 scale, higher = more penalty)."""
-    util = slot.get("provider_7day_util", 0.5)
-    return max(0.0, float(util) - 0.8)   # penalty only above 80% utilization
+    util = slot.get("provider_7day_util", slot.get("provider_utilization", 0.5))
+    return max(0.0, float(util) - 0.7)
+
+
+def _overbooking_risk(slot: Dict[str, Any]) -> float:
+    risk = float(slot.get("provider_overbooking_ratio", 0.0))
+    if "slot_demand_count" in slot and slot["slot_demand_count"] > 0:
+        demand = float(slot.get("slot_demand_count", 0))
+        risk = min(1.0, risk + min(demand / 20.0, 0.3))
+    return min(1.0, max(0.0, risk))
 
 
 def rank_slots(
@@ -27,12 +35,25 @@ def rank_slots(
 ) -> List[Dict[str, Any]]:
     """Multi-factor slot ranking.
 
-    score = w_prob * probability
-            + w_pref * preference_score
-            - w_util * utilization_penalty
-            - cost_adjusted_penalty
+    final_score = probability * w_prob
+                  + preference_score * w_pref
+                  + patient_preference_match * w_patient_pref
+                  + slot_popularity_score * w_popularity
+                  - utilization_penalty * w_util
+                  - fn_cost_scale * (1 - probability)
+                  - fp_cost_scale * probability * overbooking_risk
     """
-    weights = ranking_weights or {"probability": 0.6, "preference_score": 0.25, "utilization_penalty": 0.15}
+    weights = {
+        "probability": 0.6,
+        "preference_score": 0.2,
+        "patient_preference_match": 0.2,
+        "slot_popularity_score": 0.1,
+        "utilization_penalty": 0.1,
+        "fn_cost_scale": 0.001,
+        "fp_cost_scale": 0.001,
+    }
+    if ranking_weights:
+        weights.update(ranking_weights)
 
     scored: List[Dict[str, Any]] = []
     for candidate in candidates:
@@ -41,24 +62,30 @@ def rank_slots(
             continue
 
         pref = _preference_score(candidate, preferred_time)
-        util_pen = _utilization_penalty(candidate)
-
-        # Cost-adjusted component (normalized to 0–1)
-        fn_cost = (1.0 - prob) * cost_fn
-        fp_cost = prob * cost_fp
-        cost_component = (fn_cost + fp_cost) / (cost_fn + cost_fp)
+        patient_pref = float(candidate.get("patient_preference_match", 0.0))
+        provider_util = float(candidate.get("provider_7day_util", candidate.get("provider_utilization", 0.0)))
+        popularity = float(candidate.get("slot_popularity_score", 0.0))
+        util_penalty = _utilization_penalty(candidate)
+        overbooking_risk = _overbooking_risk(candidate)
 
         score = (
-            weights.get("probability", 0.6) * prob
-            + weights.get("preference_score", 0.25) * pref
-            - weights.get("utilization_penalty", 0.15) * util_pen
-            - 0.1 * cost_component
+            prob * float(weights["probability"])
+            + pref * float(weights["preference_score"])
+            + patient_pref * float(weights["patient_preference_match"])
+            + popularity * float(weights["slot_popularity_score"])
+            - util_penalty * float(weights["utilization_penalty"])
+            - float(weights["fn_cost_scale"]) * (1.0 - prob)
+            - float(weights["fp_cost_scale"]) * prob * overbooking_risk
         )
 
         entry = candidate.copy()
         entry["score"] = round(score, 6)
         entry["preference_score"] = pref
-        entry["utilization_penalty"] = util_pen
+        entry["patient_preference_match"] = patient_pref
+        entry["provider_utilization"] = provider_util
+        entry["slot_popularity_score"] = popularity
+        entry["utilization_penalty"] = round(util_penalty, 6)
+        entry["overbooking_risk"] = round(overbooking_risk, 6)
         scored.append(entry)
 
     return sorted(scored, key=lambda x: x["score"], reverse=True)[:top_k]

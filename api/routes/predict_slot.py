@@ -20,6 +20,7 @@ from src.database import (
     get_provider_appointments,
     insert_appointment,
 )
+from src.database.errors import EntityNotFoundError
 from src.utils.logger import get_logger, log_request
 
 logger = get_logger(__name__)
@@ -63,6 +64,8 @@ def recommend_slots(payload: RecommendSlotsRequest, db: Database = Depends(get_d
             total=len(items),
             parsed_intent=parsed,
         )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=exc.to_dict())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:

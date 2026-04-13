@@ -61,6 +61,15 @@ def get_collection_names() -> dict:
     }
 
 
+def ensure_database_indexes(db):
+    cols = get_collection_names()
+    db[cols["patients"]].create_index([("fullName", 1)], name="idx_patient_fullName", unique=False)
+    db[cols["patients"]].create_index([("firstName", 1), ("lastName", 1)], name="idx_patient_name", unique=False)
+    db[cols["providers"]].create_index([("firstName", 1), ("lastName", 1), ("role", 1)], name="idx_provider_name_role", unique=False)
+    db[cols["appointments"]].create_index([("provider_id", 1), ("patient_id", 1), ("appt_date", 1), ("appt_hour", 1)], name="idx_appointments_provider_patient_date", unique=False)
+    db[cols["slot_statistics"]].create_index([("provider_id", 1), ("weekday", 1), ("hour", 1)], name="idx_slot_statistics_provider_weekday_hour", unique=True)
+
+
 def get_db():
     """FastAPI dependency — yields MongoDB database instance. Read-only."""
     db = get_database()
@@ -71,7 +80,8 @@ def get_db():
 
 
 def init_db() -> None:
-    """Verify MongoDB connection only — NO writes, NO index creation."""
-    get_database().command("ping")
+    """Verify MongoDB connection without performing schema updates on startup."""
+    db = get_database()
+    db.command("ping")
     from src.utils.logger import get_logger
-    get_logger(__name__).info("MongoDB connected: db=%s", get_db_name())
+    get_logger(__name__).info("MongoDB connected: db=%s (skipping automatic index creation)", get_db_name())

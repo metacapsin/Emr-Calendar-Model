@@ -2,6 +2,8 @@
 import pytest
 
 from src.api.nlp_parser import parse_appointment_request
+from src.features.slot_feature_builder import build_slots_feature_dataframe
+from src.models.inference import SlotInferenceEngine
 from src.recommendation.recommender import AppointmentRecommender
 from src.recommendation.slot_ranker import aggregate_recommendations, rank_slots
 from src.scheduling.slot_generator import generate_candidate_slots
@@ -144,3 +146,40 @@ def test_recommender_returns_empty_for_impossible_request():
         top_k=3,
     )
     assert results == []
+
+
+def test_inference_probabilities_return_valid_scores():
+    engine = SlotInferenceEngine("models/slot_prediction_model.pkl")
+    slots = [
+        {"date": "2026-04-01", "hour": 9, "weekday": 4, "month": 4, "day": 1, "year": 2026, "slot_duration_minutes": 60, "slot_popularity_score": 0.3, "slot_historical_success_rate": 0.4},
+        {"date": "2026-04-01", "hour": 14, "weekday": 4, "month": 4, "day": 1, "year": 2026, "slot_duration_minutes": 60, "slot_popularity_score": 0.6, "slot_historical_success_rate": 0.7},
+        {"date": "2026-04-02", "hour": 16, "weekday": 5, "month": 4, "day": 2, "year": 2026, "slot_duration_minutes": 60, "slot_popularity_score": 0.2, "slot_historical_success_rate": 0.5},
+    ]
+    df = build_slots_feature_dataframe(slots, PATIENT, PROVIDER, engine.feature_columns)
+    scores = [p[1] for p in engine.predict_proba(df)]
+    assert len(scores) == 3
+    assert all(0.0 <= score <= 1.0 for score in scores)
+
+
+def test_high_cancel_rate_patient_probabilities_are_valid():
+    engine = SlotInferenceEngine("models/slot_prediction_model.pkl")
+    slot = {"date": "2026-04-01", "hour": 10, "weekday": 4, "month": 4, "day": 1, "year": 2026, "slot_duration_minutes": 60, "slot_popularity_score": 0.4, "slot_historical_success_rate": 0.5}
+    patient_low_risk = {**PATIENT, "patient_cancel_rate": 0.0, "patient_hist_success_rate": 0.9}
+    patient_high_risk = {**PATIENT, "patient_cancel_rate": 0.8, "patient_hist_success_rate": 0.2}
+
+    df_low = build_slots_feature_dataframe([slot], patient_low_risk, PROVIDER, engine.feature_columns)
+    df_high = build_slots_feature_dataframe([slot], patient_high_risk, PROVIDER, engine.feature_columns)
+    low_prob = engine.predict_proba(df_low)[0][1]
+    high_prob = engine.predict_proba(df_high)[0][1]
+    assert 0.0 <= low_prob <= 1.0
+    assert 0.0 <= high_prob <= 1.0
+
+
+def test_rank_slots_prefers_high_score_slots():
+    candidates = [
+        {"date": "2026-04-01", "hour": 9, "prob": 0.8, "provider_7day_util": 0.2, "slot_popularity_score": 0.5},
+        {"date": "2026-04-01", "hour": 15, "prob": 0.8, "provider_7day_util": 0.9, "slot_popularity_score": 0.3},
+    ]
+    ranked = rank_slots(candidates, top_k=2, preferred_time="morning")
+    assert ranked[0]["hour"] == 9
+    assert ranked[0]["score"] > ranked[1]["score"]
