@@ -62,6 +62,14 @@ def get_collection_names() -> dict:
 
 
 def ensure_database_indexes(db):
+    from src.config.read_only_config import is_write_enabled, log_write_blocked
+    
+    # WRITE GUARD: Skip index creation in read-only mode
+    if not is_write_enabled():
+        log_write_blocked("ensure_database_indexes", "create_index operations")
+        logger.info("Index creation skipped (read-only mode)")
+        return
+    
     cols = get_collection_names()
     db[cols["patients"]].create_index([("fullName", 1)], name="idx_patient_fullName", unique=False)
     db[cols["patients"]].create_index([("firstName", 1), ("lastName", 1)], name="idx_patient_name", unique=False)
@@ -84,4 +92,15 @@ def init_db() -> None:
     db = get_database()
     db.command("ping")
     from src.utils.logger import get_logger
-    get_logger(__name__).info("MongoDB connected: db=%s (skipping automatic index creation)", get_db_name())
+    from src.config.read_only_config import is_write_enabled
+    
+    log = get_logger(__name__)
+    log.info("MongoDB connected: db=%s (skipping automatic index creation)", get_db_name())
+    
+    if not is_write_enabled():
+        log.warning("=" * 60)
+        log.warning("READ-ONLY PRODUCTION MODE ACTIVE")
+        log.warning("- All DB writes are blocked")
+        log.warning("- Feature fallbacks are enabled")
+        log.warning("- Recommendations will work with dynamic statistics")
+        log.warning("=" * 60)

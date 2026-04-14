@@ -232,6 +232,16 @@ def get_provider_data(db: Database, provider_id: str) -> Dict[str, Any]:
     else:
         working_days = [0, 1, 2, 3, 4]
 
+    # Hourly utilization curve: {hour: fraction_of_total_appts}
+    from collections import Counter
+    hour_counts = Counter(int(a["appt_hour"]) for a in appts if a.get("appt_hour") is not None)
+    total_for_util = max(1, sum(hour_counts.values()))
+    hourly_util_curve = {h: round(c / total_for_util, 4) for h, c in hour_counts.items()}
+
+    # Peak hour density: hours above mean utilization
+    mean_util = total_for_util / max(1, len(hour_counts)) if hour_counts else 0
+    peak_hour_set = {h for h, c in hour_counts.items() if c > mean_util}
+
     return {
         "provider_id":                     provider_id,
         "provider_encoded":                provider_encoded,
@@ -245,9 +255,12 @@ def get_provider_data(db: Database, provider_id: str) -> Dict[str, Any]:
         "provider_7day_util":              round(util_7d, 4),
         "provider_30day_util":             round(util_30d, 4),
         "provider_utilization":            round(util_7d, 4),
+        "provider_utilization_rate":       round(util_7d, 4),
         "provider_avg_daily_appointments": round(avg_daily_appointments, 2),
         "provider_overbooking_ratio":      round(overbooking_ratio, 4),
         "provider_peak_hours":             peak_hours,
+        "provider_peak_hour_set":          list(peak_hour_set),
+        "provider_hourly_util_curve":      hourly_util_curve,
         "provider_hist_success_rate":      round(success_rate, 4),
         "provider_hist_appt_count":        total,
         "provider_slot_volume":            max(1, total),
@@ -273,9 +286,12 @@ def _default_provider(provider_id: str) -> Dict[str, Any]:
         "provider_7day_util":         0.5,
         "provider_30day_util":        0.5,
         "provider_utilization":       0.5,
+        "provider_utilization_rate":  0.5,
         "provider_avg_daily_appointments": 1.0,
         "provider_overbooking_ratio":  0.0,
         "provider_peak_hours":         [],
+        "provider_peak_hour_set":      [],
+        "provider_hourly_util_curve":  {},
         "provider_hist_success_rate":  0.5,
         "provider_hist_appt_count":   0,
         "provider_slot_volume":       1,
@@ -301,6 +317,14 @@ def get_booked_slots(db: Database, provider_id: str, date_iso: str) -> List[int]
 
 
 def ensure_database_indexes(db: Database) -> None:
+    from src.config.read_only_config import is_write_enabled, log_write_blocked
+    
+    # WRITE GUARD: Skip index creation in read-only mode
+    if not is_write_enabled():
+        log_write_blocked("ensure_database_indexes", "create_index operations")
+        logger.info("Index creation skipped (read-only mode)")
+        return
+    
     col = _cols(db)
     db[col["patients"]].create_index([("fullName", 1)], name="idx_patient_fullName", unique=False)
     db[col["patients"]].create_index([("firstName", 1), ("lastName", 1)], name="idx_patient_name", unique=False)
@@ -394,33 +418,67 @@ def get_provider_by_name(db: Database, provider_name: str) -> str:
 
 
 def refresh_slot_statistics(db: Database) -> None:
+    """Recompute per-(provider, weekday, hour) success rates from appointments."""
+    from src.config.read_only_config import is_write_enabled, log_write_blocked
+    
     col = _cols(db)
+    # Fixed pipeline: was missing '$' on $group stage
     pipeline = [
-        {"$match": {"status": {"$in": ["Confirmed", "Confirmed           "]}}},
-        {"$project": {"provider_id": 1, "weekday": {"$dayOfWeek": {"$dateFromString": {"dateString": "$appt_date"}}}, "hour": "$appt_hour"}},
-        {"$addFields": {"weekday": {"$subtract": ["$weekday", 1]}}},
-        {"group": {"_id": {"provider_id": "$provider_id", "weekday": "$weekday", "hour": "$hour"}, "count": {"$sum": 1}}},
+        {"$match": {"appt_date": {"$ne": None}, "appt_hour": {"$ne": None}}},
+        {
+            "$project": {
+                "provider_id": 1,
+                "appt_hour": 1,
+                "status": 1,
+                "weekday": {
+                    "$subtract": [
+                        {"$dayOfWeek": {"$dateFromString": {"dateString": "$appt_date", "onError": datetime.utcnow()}}},
+                        1,
+                    ]
+                },
+            }
+        },
+        {
+            "$group": {
+                "_id": {"provider_id": "$provider_id", "weekday": "$weekday", "hour": "$appt_hour"},
+                "total_count": {"$sum": 1},
+                "success_count": {
+                    "$sum": {"$cond": [{"$in": ["$status", ["Confirmed", "Confirmed           "]]}, 1, 0]}
+                },
+            }
+        },
     ]
     try:
         stats = list(db[col["appointments"]].aggregate(pipeline))
-    except Exception:
+    except Exception as exc:
+        logger.error("refresh_slot_statistics failed: %s", exc)
         return
 
     for stat in stats:
         _id = stat["_id"]
-        provider_id = _id["provider_id"]
-        weekday = _id["weekday"]
-        hour = _id["hour"]
-        total_count = int(stat["count"])
-        success_rate = 1.0
-        popularity_score = min(1.0, 0.3 + 0.2 * success_rate + min(total_count / 20.0, 0.2))
+        provider_id = _id.get("provider_id")
+        weekday = _id.get("weekday")
+        hour = _id.get("hour")
+        if provider_id is None or weekday is None or hour is None:
+            continue
+        total_count = int(stat["total_count"])
+        success_count = int(stat["success_count"])
+        success_rate = success_count / max(1, total_count)
+        # Popularity: base 0.2 + success signal + volume signal (capped)
+        popularity_score = min(1.0, 0.2 + 0.5 * success_rate + min(total_count / 30.0, 0.3))
+        
+        # WRITE GUARD: Skip DB update in read-only mode
+        if not is_write_enabled():
+            log_write_blocked("refresh_slot_statistics", "update_one on slot_statistics")
+            continue
+        
         db[col["slot_statistics"]].update_one(
             {"provider_id": provider_id, "weekday": weekday, "hour": hour},
             {"$set": {
                 "total_count": total_count,
-                "success_count": total_count,
-                "success_rate": success_rate,
-                "popularity_score": popularity_score,
+                "success_count": success_count,
+                "success_rate": round(success_rate, 4),
+                "popularity_score": round(popularity_score, 4),
                 "updated_at": datetime.utcnow(),
             }},
             upsert=True,
@@ -428,7 +486,14 @@ def refresh_slot_statistics(db: Database) -> None:
 
 
 def get_slot_statistics(db: Database, provider_id: str, weekday: int, hour: int) -> Dict[str, Any]:
+    from src.config.read_only_config import is_write_enabled
+    
     col  = _cols(db)
+    
+    # READ-ONLY OPTIMIZATION: Skip DB lookup and use dynamic computation
+    if not is_write_enabled():
+        return _compute_dynamic_slot_statistics(db, col, provider_id, weekday, hour)
+    
     stat = db[col["slot_statistics"]].find_one({
         "provider_id": provider_id,
         "weekday":     weekday,
@@ -441,38 +506,62 @@ def get_slot_statistics(db: Database, provider_id: str, weekday: int, hour: int)
             "total_count":      int(stat.get("total_count",        0)),
         }
 
+    # Fallback: compute on-the-fly from appointments (correct weekday filter)
+    return _compute_dynamic_slot_statistics(db, col, provider_id, weekday, hour)
+
+
+def _compute_dynamic_slot_statistics(
+    db: Database, 
+    col: dict, 
+    provider_id: str, 
+    weekday: int, 
+    hour: int
+) -> Dict[str, Any]:
+    """
+    Enhanced fallback with high-variance per-slot features.
+    Computes statistics dynamically from appointment history.
+    Used when slot_statistics collection is unavailable or in read-only mode.
+    """
     appts = list(db[col["appointments"]].find({
         "provider_id": provider_id,
         "appt_date":   {"$ne": None},
         "appt_hour":   hour,
     }))
-    total = len([a for a in appts if _parse_date(a.get("appt_date")).weekday() == weekday])
-    confirmed = [a for a in appts if str(a.get("status", "")).strip() in CONFIRMED_STATUSES]
-    success_rate = len(confirmed) / max(1, total)
-    popularity_score = min(1.0, 0.3 + 0.4 * success_rate + min(total / 20.0, 0.2))
-    logger.info("[slot_statistics] fallback provider_id=%s weekday=%s hour=%s total=%d success_rate=%.2f",
-                provider_id, weekday, hour, total, success_rate)
+    slot_appts = [a for a in appts if _parse_date(a.get("appt_date")).weekday() == weekday]
+    total = len(slot_appts)
+    confirmed = [a for a in slot_appts if str(a.get("status", "")).strip() in CONFIRMED_STATUSES]
+    
+    # Base success rate from actual data
+    success_rate = len(confirmed) / max(1, total) if total > 0 else 0.5
+    
+    # Enhanced popularity: hour demand * weekday demand * volume signal
+    # Import demand weights from feature builder for consistency
+    from src.features.slot_feature_builder import _HOUR_DEMAND_WEIGHTS, _WEEKDAY_DEMAND_WEIGHTS
+    hour_weight = _HOUR_DEMAND_WEIGHTS.get(hour, 0.5)
+    weekday_weight = _WEEKDAY_DEMAND_WEIGHTS.get(weekday, 0.5)
+    volume_signal = min(0.3, total / 30.0)
+    popularity_score = min(1.0, 0.2 + 0.5 * success_rate + volume_signal + 0.1 * hour_weight * weekday_weight)
+    
     return {
-        "success_rate":     success_rate if total > 0 else 0.5,
-        "popularity_score": popularity_score,
+        "success_rate":     round(success_rate, 4),
+        "popularity_score": round(popularity_score, 4),
         "total_count":      total,
     }
 
 
-# ─── Appointments ─────────────────────────────────────────────────────────────
-    col  = _cols(db)
-    stat = db[col["slot_statistics"]].find_one({
-        "provider_id": provider_id,
-        "weekday":     weekday,
-        "hour":        hour,
-    })
-    if not stat:
-        return {"success_rate": 0.5, "popularity_score": 0.0, "total_count": 0}
-    return {
-        "success_rate":     float(stat.get("success_rate",     0.5)),
-        "popularity_score": float(stat.get("popularity_score", 0.0)),
-        "total_count":      int(stat.get("total_count",        0)),
-    }
+def get_provider_hourly_utilization(db: Database, provider_id: str) -> Dict[int, float]:
+    """Return {hour: utilization_rate} across all history for a provider."""
+    col = _cols(db)
+    appts = list(db[col["appointments"]].find(
+        {"provider_id": provider_id, "appt_hour": {"$ne": None}},
+        {"appt_hour": 1, "_id": 0},
+    ))
+    if not appts:
+        return {}
+    from collections import Counter
+    counts = Counter(int(a["appt_hour"]) for a in appts if a.get("appt_hour") is not None)
+    total = max(1, sum(counts.values()))
+    return {hour: round(count / total, 4) for hour, count in counts.items()}
 
 
 # ─── Appointments ─────────────────────────────────────────────────────────────
@@ -488,6 +577,8 @@ def insert_appointment(
     is_telehealth: bool = False,
     is_new_patient: bool = False,
 ) -> Dict[str, Any]:
+    from src.config.read_only_config import is_write_enabled, log_write_blocked
+    
     col = _cols(db)
     doc = {
         "patient_id":       patient_id,
@@ -502,6 +593,17 @@ def insert_appointment(
         "created_at":       datetime.utcnow(),
         "updated_at":       datetime.utcnow(),
     }
+    
+    # WRITE GUARD: Skip DB insert in read-only mode, return mock appointment
+    if not is_write_enabled():
+        log_write_blocked("insert_appointment", "insert_one on appointments")
+        doc["_id"] = "READ_ONLY_MOCK_ID"
+        logger.info(
+            "Appointment booking simulated (read-only): patient=%s provider=%s date=%s hour=%s",
+            patient_id, provider_id, appt_date, appt_hour
+        )
+        return doc
+    
     result     = db[col["appointments"]].insert_one(doc)
     doc["_id"] = str(result.inserted_id)
     logger.info("Appointment booked: id=%s patient=%s provider=%s date=%s hour=%s",
@@ -510,11 +612,24 @@ def insert_appointment(
 
 
 def update_appointment_status(db: Database, appointment_id: str, status: str) -> Optional[Dict[str, Any]]:
+    from src.config.read_only_config import is_write_enabled, log_write_blocked
+    
     col = _cols(db)
     oid = _to_oid(appointment_id)
     if not oid:
         logger.warning("Invalid appointment_id: %s", appointment_id)
         return None
+    
+    # WRITE GUARD: Skip DB update in read-only mode, return current state
+    if not is_write_enabled():
+        log_write_blocked("update_appointment_status", "find_one_and_update on appointments")
+        result = db[col["appointments"]].find_one({"_id": oid})
+        logger.info(
+            "Status update skipped (read-only): appt=%s new_status=%s",
+            appointment_id, status
+        )
+        return result
+    
     result = db[col["appointments"]].find_one_and_update(
         {"_id": oid},
         {"$set": {"status": status, "updated_at": datetime.utcnow()}},

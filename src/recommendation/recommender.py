@@ -52,22 +52,21 @@ class AppointmentRecommender:
         params = parse_appointment_request(request_text)
         logger.info("NLP parsed: %s", params)
 
-        # ── Resolve patient MongoDB _id ────────────────────────────────────────
+        # -- Resolve patient MongoDB _id
         patient_id: Optional[str] = patient_data.get("patient_id") or None
         if not patient_id and db is not None:
             patient_name = patient_data.get("patient_name") or params.get("patient_name")
             if patient_name:
                 patient_id = get_patient_by_name(db, patient_name)
 
-        # ── Resolve provider MongoDB _id ───────────────────────────────────────
+        # -- Resolve provider MongoDB _id
         provider_id: Optional[str] = provider_data.get("provider_id") or None
         if not provider_id and db is not None:
-            nlp_provider_name = params.get("provider_name")
             nlp_provider_num = params.get("provider_encoded")
             if nlp_provider_num is not None:
                 provider_id = _lookup_provider_id_by_encoded(db, int(nlp_provider_num))
             if not provider_id:
-                provider_name = provider_data.get("provider_name") or nlp_provider_name
+                provider_name = provider_data.get("provider_name") or params.get("provider_name")
                 if provider_name:
                     provider_id = get_provider_by_name(db, provider_name)
 
@@ -79,7 +78,7 @@ class AppointmentRecommender:
 
         logger.info("Resolved patient_id=%s provider_id=%s", patient_id, provider_id)
 
-        # ── DB enrichment — fetch full feature dicts by _id ───────────────────
+        # -- DB enrichment: fetch full feature dicts by _id
         if db is not None:
             if patient_id:
                 db_patient = get_patient_data(db, patient_id, provider_id=provider_id)
@@ -88,13 +87,12 @@ class AppointmentRecommender:
                 db_provider = get_provider_data(db, provider_id)
                 provider_data = {**db_provider, **provider_data}
 
-        # Ensure _id fields are set in dicts for downstream use
         if patient_id:
             patient_data["patient_id"] = patient_id
         if provider_id:
             provider_data["provider_id"] = provider_id
 
-        # ── Date window ────────────────────────────────────────────────────────
+        # -- Date window
         now = datetime.utcnow().date()
         if params.get("date"):
             try:
@@ -108,7 +106,7 @@ class AppointmentRecommender:
             start_date = now + timedelta(days=self._slot_cfg.get("search_start_days", 1))
             end_date   = start_date + timedelta(days=self._slot_cfg.get("search_days", 14))
 
-        # ── Blocked dates + booked slots from DB ───────────────────────────────
+        # -- Blocked dates + booked slots from DB
         blocked_dates: List[str] = []
         booked_by_date: Dict[str, List[int]] = {}
 
@@ -122,7 +120,7 @@ class AppointmentRecommender:
                     booked_by_date[date_iso] = booked
                 current += timedelta(days=1)
 
-        # ── Generate candidate slots ───────────────────────────────────────────
+        # -- Generate candidate slots
         provider_availability = {
             "provider_encoded": provider_data.get("provider_encoded"),
             "working_days":     provider_data.get("working_days", list(range(5))),
@@ -148,20 +146,37 @@ class AppointmentRecommender:
             logger.warning("No candidate slots for: %s", request_text)
             return []
 
-        # ── Enrich slots with DB statistics ───────────────────────────────────
+        # -- Enrich slots with DB statistics + per-slot signals
         if db is not None and provider_id:
+            pv_hourly_curve = provider_data.get("provider_hourly_util_curve", {}) or {}
+            pv_peak_set     = (
+                provider_data.get("provider_peak_hour_set", [])
+                or provider_data.get("provider_peak_hours", [])
+            )
+            pv_overbook = provider_data.get(
+                "provider_overbooking_ratio",
+                min(1.0, provider_data.get("provider_total_appts", 0) /
+                    max(1.0, provider_data.get("max_daily_slots", 16) * 7.0)),
+            )
             for slot in slots:
-                stats = get_slot_statistics(db, provider_id, slot["weekday"], slot["hour"])
+                stats     = get_slot_statistics(db, provider_id, slot["weekday"], slot["hour"])
+                slot_hour = slot["hour"]
                 slot["slot_historical_success_rate"] = stats["success_rate"]
                 slot["slot_popularity_score"]        = stats["popularity_score"]
                 slot["slot_demand_count"]            = stats["total_count"]
-                slot["slot_days_ahead"]              = max(0, (datetime.fromisoformat(slot["date"]).date() - now).days)
-                slot["provider_overbooking_ratio"]    = provider_data.get("provider_overbooking_ratio", min(1.0, provider_data.get("provider_total_appts", 0) / max(1.0, provider_data.get("max_daily_slots", 16) * 7.0)))
-                slot["patient_time_preference_match"] = 1.0 if get_time_of_day(slot["hour"]) == patient_data.get("patient_preferred_time", "") else 0.0
-                slot["provider_peak_hour_score"]      = 1.0 if slot["hour"] in provider_data.get("provider_peak_hours", []) else 0.0
+                slot["slot_days_ahead"]              = max(
+                    0, (datetime.fromisoformat(slot["date"]).date() - now).days
+                )
+                slot["provider_overbooking_ratio"]   = pv_overbook
+                # These three vary per slot hour:
+                slot["patient_time_preference_match"] = (
+                    1.0 if get_time_of_day(slot_hour) == patient_data.get("patient_preferred_time", "") else 0.0
+                )
+                slot["provider_peak_hour_score"] = 1.0 if slot_hour in pv_peak_set else 0.0
+                slot["provider_hour_load"]       = float(pv_hourly_curve.get(slot_hour, 0.0))
 
-        # ── Build features + predict ───────────────────────────────────────────
-        feature_df = build_slots_feature_dataframe(
+        # -- Build features + predict
+        feature_df    = build_slots_feature_dataframe(
             slots, patient_data, provider_data, self.engine.feature_columns
         )
         probabilities = self.engine.predict_proba(feature_df)
@@ -169,23 +184,26 @@ class AppointmentRecommender:
         results: List[Dict[str, Any]] = []
         for i, slot in enumerate(slots):
             results.append({
-                "date":                      slot["date"],
-                "time":                      f"{slot['hour']:02d}:00",
-                "hour":                      slot["hour"],
-                "weekday":                   slot["weekday"],
-                "prob":                      round(float(probabilities[i][1]), 4),
-                "patient_id":                patient_id,
-                "provider_id":               provider_id,
-                "provider_encoded":          provider_data.get("provider_encoded"),
-                "provider_7day_util":        provider_data.get("provider_7day_util", 0.5),
-                "slot_popularity_score":     slot.get("slot_popularity_score", 0.0),
-                "patient_preference_match":  slot.get("patient_time_preference_match", 0.0),
+                "date":                       slot["date"],
+                "time":                       f"{slot['hour']:02d}:00",
+                "hour":                       slot["hour"],
+                "weekday":                    slot["weekday"],
+                "prob":                       round(float(probabilities[i][1]), 4),
+                "patient_id":                 patient_id,
+                "provider_id":                provider_id,
+                "provider_encoded":           provider_data.get("provider_encoded"),
+                "provider_7day_util":         provider_data.get("provider_7day_util", 0.5),
+                "provider_avg_daily_appointments": provider_data.get("provider_avg_daily_appointments", 3.0),
+                "slot_popularity_score":      slot.get("slot_popularity_score", 0.0),
+                "slot_demand_count":          slot.get("slot_demand_count", 0.0),
+                "patient_preference_match":   slot.get("patient_time_preference_match", 0.0),
                 "provider_overbooking_ratio": slot.get("provider_overbooking_ratio", 0.0),
-                "slot_quality_score":        slot.get("slot_quality_score", 0.0),
-                "provider_peak_hour_score":  slot.get("provider_peak_hour_score", 0.0),
+                "slot_quality_score":         slot.get("slot_quality_score", 0.0),
+                "provider_peak_hour_score":   slot.get("provider_peak_hour_score", 0.0),
+                "provider_hour_load":         slot.get("provider_hour_load", 0.0),
             })
 
-        # ── Rank ───────────────────────────────────────────────────────────────
+        # -- Rank
         top_k_val = top_k or self._slot_cfg.get("top_k", 5)
         ranked = rank_slots(
             candidates=results,
@@ -204,174 +222,7 @@ class AppointmentRecommender:
         return final
 
 
-# ── Name → MongoDB _id lookup helpers ─────────────────────────────────────────
-
-def _normalize(name: str) -> str:
-    return " ".join(name.strip().upper().split())
-
-
-def _lookup_patient_id(db: Database, patient_name: str) -> Optional[str]:
-    """
-    Find patient MongoDB _id by name.
-    DB: { _id: ObjectId, fullName: "EMMA GAMEZ" }
-        OR nested: { _id: ObjectId, data: { fullName: "EMMA GAMEZ" } }
-
-    Steps:
-      1. Exact case-insensitive on data.fullName, then fullName
-      2. All tokens AND on same fields
-      3. First OR last token on same fields
-    """
-    from src.database.db_connection import get_collection_names
-    coll   = db[get_collection_names()["patients"]]
-    norm   = _normalize(patient_name)
-    tokens = norm.split()
-
-    logger.info("[patient_lookup] input='%s'  normalized='%s'  tokens=%s",
-                patient_name, norm, tokens)
-
-    doc: Optional[dict] = None
-
-    # Step 1 — exact match on fullName (top-level)
-    q   = {"fullName": {"$regex": f"^{re.escape(norm)}$", "$options": "i"}}
-    doc = coll.find_one(q)
-    logger.info("[patient_lookup] step1 exact fullName  found=%s", bool(doc))
-
-    # Step 2 — all tokens AND on fullName
-    if not doc and len(tokens) >= 2:
-        q   = {"$and": [{"fullName": {"$regex": re.escape(t), "$options": "i"}} for t in tokens]}
-        doc = coll.find_one(q)
-        logger.info("[patient_lookup] step2 all-tokens fullName  found=%s", bool(doc))
-
-    # Step 3 — firstName + lastName separate fields (patient-details schema)
-    if not doc and len(tokens) >= 2:
-        q   = {
-            "firstName": {"$regex": re.escape(tokens[0]),  "$options": "i"},
-            "lastName":  {"$regex": re.escape(tokens[-1]), "$options": "i"},
-        }
-        doc = coll.find_one(q)
-        logger.info("[patient_lookup] step3 firstName+lastName  found=%s", bool(doc))
-
-    # Step 4 — patientFirstName + patientLastName (patient-register schema fallback)
-    if not doc and len(tokens) >= 2:
-        q   = {
-            "patientFirstName": {"$regex": re.escape(tokens[0]),  "$options": "i"},
-            "patientLastName":  {"$regex": re.escape(tokens[-1]), "$options": "i"},
-        }
-        doc = coll.find_one(q)
-        logger.info("[patient_lookup] step4 patientFirstName+patientLastName  found=%s", bool(doc))
-
-    # Step 5 — any token on fullName OR firstName OR lastName
-    if not doc:
-        q   = {"$or": [
-            {"fullName":  {"$regex": re.escape(tokens[0]),  "$options": "i"}},
-            {"fullName":  {"$regex": re.escape(tokens[-1]), "$options": "i"}},
-            {"firstName": {"$regex": re.escape(tokens[0]),  "$options": "i"}},
-            {"lastName":  {"$regex": re.escape(tokens[-1]), "$options": "i"}},
-        ]}
-        doc = coll.find_one(q)
-        logger.info("[patient_lookup] step5 partial  found=%s", bool(doc))
-
-    if not doc:
-        logger.warning("[patient_lookup] NO MATCH for '%s'", patient_name)
-        return None
-
-    _id           = str(doc["_id"])
-    resolved_name = (
-        doc.get("fullName")
-        or f"{doc.get('firstName', '')} {doc.get('lastName', '')}".strip()
-        or doc.get("data", {}).get("fullName", "?")
-    )
-    logger.info("[patient_lookup] MATCHED  name='%s'  _id=%s", resolved_name, _id)
-    return _id
-
-
-def _lookup_provider_id(db: Database, provider_name: str) -> Optional[str]:
-    """
-    Find provider MongoDB _id by name.
-    DB: { _id: ObjectId, firstName: "Tam", lastName: "Bui, FNP BC" }
-
-    Steps:
-      1. firstName exact + lastName contains last token
-      2. Any token in firstName OR lastName → best hit-count match
-      3. First token only
-      4. Last token only
-    """
-    from src.database.db_connection import get_collection_names
-    coll    = db[get_collection_names()["providers"]]
-    cleaned = re.sub(r"^(dr\.?|doctor)\s+", "", provider_name.strip(), flags=re.IGNORECASE)
-    tokens  = [t for t in cleaned.split() if len(t) > 1]
-
-    logger.info("[provider_lookup] input='%s'  cleaned='%s'  tokens=%s",
-                provider_name, cleaned, tokens)
-
-    if not tokens:
-        logger.warning("[provider_lookup] no usable tokens from '%s'", provider_name)
-        return None
-        return None
-
-
-def _lookup_provider_id_by_encoded(db: Database, provider_encoded: int) -> Optional[str]:
-    from src.database.db_connection import get_collection_names
-    coll = db[get_collection_names()["providers"]]
-    query = {"provider_encoded": provider_encoded}
-    doc = coll.find_one(query)
-    if doc:
-        return str(doc["_id"])
-    return None
-
-    # Base filter: only match users with provider role
-    role_filter = {"role": {"$in": ["provider"]}}
-    doc: Optional[dict] = None
-
-    # Step 1 — firstName exact + lastName contains last token (provider role only)
-    if len(tokens) >= 2:
-        q   = {
-            **role_filter,
-            "firstName": {"$regex": f"^{re.escape(tokens[0])}$", "$options": "i"},
-            "lastName":  {"$regex": re.escape(tokens[-1]),        "$options": "i"},
-        }
-        doc = coll.find_one(q)
-        logger.info("[provider_lookup] step1 firstName+lastName  found=%s", bool(doc))
-
-    # Step 2 — any token in firstName OR lastName (provider role only) → best match
-    if not doc:
-        or_clauses = []
-        for t in tokens:
-            e = re.escape(t)
-            or_clauses.append({"firstName": {"$regex": e, "$options": "i"}})
-            or_clauses.append({"lastName":  {"$regex": e, "$options": "i"}})
-        candidates = list(coll.find({"$and": [role_filter, {"$or": or_clauses}]}))
-        logger.info("[provider_lookup] step2 any-token  candidates=%d", len(candidates))
-        doc = _best_provider_match(candidates, tokens)
-        logger.info("[provider_lookup] step2 best-match  found=%s", bool(doc))
-
-    # Step 3 — first token only (provider role)
-    if not doc:
-        q   = {"$and": [role_filter, {"$or": [
-            {"firstName": {"$regex": re.escape(tokens[0]), "$options": "i"}},
-            {"lastName":  {"$regex": re.escape(tokens[0]), "$options": "i"}},
-        ]}]}
-        doc = coll.find_one(q)
-        logger.info("[provider_lookup] step3 first-token  found=%s", bool(doc))
-
-    # Step 4 — last token only (provider role)
-    if not doc and len(tokens) > 1:
-        q   = {"$and": [role_filter, {"$or": [
-            {"firstName": {"$regex": re.escape(tokens[-1]), "$options": "i"}},
-            {"lastName":  {"$regex": re.escape(tokens[-1]), "$options": "i"}},
-        ]}]}
-        doc = coll.find_one(q)
-        logger.info("[provider_lookup] step4 last-token  found=%s", bool(doc))
-
-    if not doc:
-        logger.warning("[provider_lookup] NO MATCH for '%s'", provider_name)
-        return None
-
-    _id = str(doc["_id"])
-    logger.info("[provider_lookup] MATCHED  firstName='%s'  lastName='%s'  _id=%s",
-                doc.get("firstName"), doc.get("lastName"), _id)
-    return _id
-
+# -- Lookup helpers
 
 def _lookup_provider_id_by_encoded(db: Database, provider_encoded: int) -> Optional[str]:
     """Find provider _id by numeric provider_encoded field."""
@@ -401,6 +252,4 @@ def _best_provider_match(candidates: list, tokens: List[str]) -> Optional[dict]:
 
     best  = max(candidates, key=hit_count)
     score = hit_count(best)
-    logger.info("[provider_lookup] best-match  firstName='%s'  lastName='%s'  score=%d/%d",
-                best.get("firstName"), best.get("lastName"), score, len(tokens))
     return best if score > 0 else None

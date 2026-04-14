@@ -1,25 +1,14 @@
-from typing import Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pymongo.database import Database
 
 from api.schemas import (
-    BookAppointmentRequest,
-    BookAppointmentResponse,
-    PatientHistoryResponse,
-    ProviderSlotsResponse,
     RecommendSlotsRequest,
     RecommendSlotsResponse,
     SlotItem,
 )
 from api.services.recommendation_service import recommend
 from src.api.nlp_parser import parse_appointment_request
-from src.database import (
-    get_db,
-    get_patient_appointments,
-    get_provider_appointments,
-    insert_appointment,
-)
+from src.database import get_db
 from src.database.errors import EntityNotFoundError
 from src.utils.logger import get_logger, log_request
 
@@ -71,50 +60,3 @@ def recommend_slots(payload: RecommendSlotsRequest, db: Database = Depends(get_d
     except Exception as exc:
         logger.error("recommend-slots error: %s", exc)
         raise HTTPException(status_code=500, detail="Internal recommendation error")
-
-
-@router.post("/book-appointment", response_model=BookAppointmentResponse)
-def book_appointment(payload: BookAppointmentRequest, db: Database = Depends(get_db)):
-    log_request(logger, "/book-appointment", payload.model_dump())
-    try:
-        appt = insert_appointment(
-            db=db,
-            patient_id=payload.patient_id,
-            provider_id=payload.provider_id,
-            appt_date=payload.appt_date,
-            appt_hour=payload.appt_hour,
-            duration_minutes=payload.duration_minutes,
-            visit_reason=payload.visit_reason,
-            is_telehealth=payload.is_telehealth,
-            is_new_patient=payload.is_new_patient,
-        )
-        return BookAppointmentResponse(
-            appointment_id=str(appt.get("_id", "")),
-            status=str(appt.get("status", "")).strip(),
-            appt_date=appt["appt_date"],
-            appt_hour=appt["appt_hour"],
-            patient_id=payload.patient_id,
-            provider_id=payload.provider_id,
-        )
-    except Exception as exc:
-        logger.error("book-appointment error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@router.get("/provider-slots", response_model=ProviderSlotsResponse)
-def provider_slots(
-    provider_id: str = Query(..., description="MongoDB _id of provider"),
-    date: Optional[str] = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    db: Database = Depends(get_db),
-):
-    appts = get_provider_appointments(db, provider_id, date)
-    return ProviderSlotsResponse(provider_id=provider_id, date=date, appointments=appts)
-
-
-@router.get("/patient-history", response_model=PatientHistoryResponse)
-def patient_history(
-    patient_id: str = Query(..., description="MongoDB _id of patient"),
-    db: Database = Depends(get_db),
-):
-    appts = get_patient_appointments(db, patient_id)
-    return PatientHistoryResponse(patient_id=patient_id, appointments=appts, total=len(appts))

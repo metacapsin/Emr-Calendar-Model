@@ -3,9 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes.patient_routes import router as patient_router
 from api.routes.predict_slot import router as slot_router
-from api.routes.provider_routes import router as provider_router
 from src.database.db_connection import init_db
 from dotenv import load_dotenv
 load_dotenv()
@@ -16,8 +14,12 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("=" * 70)
     logger.info("Starting up — initializing database")
     init_db()
+    logger.info("EMR Slot Recommendation Engine - API Mode: MINIMAL")
+    logger.info("Active endpoints: POST /recommend-slots, GET /health")
+    logger.info("=" * 70)
     yield
     logger.info("Shutting down")
 
@@ -27,6 +29,8 @@ app = FastAPI(
     version="1.0.0",
     description="ML-powered appointment slot recommendation for EMR systems",
     lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 app.add_middleware(
@@ -36,9 +40,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include core recommendation router only
 app.include_router(slot_router)
-app.include_router(patient_router)
-app.include_router(provider_router)
 
 
 @app.get("/health", tags=["system"])
