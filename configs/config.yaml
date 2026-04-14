@@ -45,6 +45,45 @@ ranking:
 # ============================================================
 DB_WRITE_ENABLED: false
 
+# ============================================================
+# TRAINING CONFIGURATION — Notebook Parity Settings
+# ============================================================
+training:
+  model_type: "catboost"
+  notebook_parity: true  # Ensure perfect parity with feature_engineering.ipynb
+  
+  # Model hyperparameters (matches notebook best configuration)
+  hyperparameters:
+    iterations: 800
+    learning_rate: 0.05
+    depth: 6
+    l2_leaf_reg: 3
+    loss_function: "Logloss"
+    eval_metric: "AUC"
+    random_seed: 42
+  
+  # Training strategy
+  time_based_split: true  # Use temporal split (not random)
+  test_size: 0.2
+  cv_folds: 5
+  
+  # Hyperparameter tuning (optional, takes longer)
+  enable_tuning: false
+  tuning_iterations: 20
+  
+  # Calibration
+  enable_calibration: true
+  calibration_method: "isotonic"
+  
+  # Feature engineering
+  enhance_features: true  # Apply notebook feature engineering
+  feature_sources:
+    - "base_features"  # From ml_ready_appointments.csv
+    - "slot_features"  # Slot demand, popularity, success rate
+    - "historical_features"  # Leakage-aware historical stats
+    - "rolling_features"  # 7D/30D time-window features
+    - "loyalty_features"  # Patient-provider loyalty
+
 logging:
   level: "INFO"
   format: "json"

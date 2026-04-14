@@ -41,6 +41,11 @@ class SlotInferenceEngine:
             "Model loaded: name=%s features=%d calibration=%s",
             self.model_name, len(self.feature_columns), self.calibration_method or "none",
         )
+        
+        # Log feature list for debugging
+        logger.info("Model expects %d features: %s", 
+                   len(self.feature_columns), 
+                   self.feature_columns[:10] + ['...'] if len(self.feature_columns) > 10 else self.feature_columns)
 
     # ── Feature validation ────────────────────────────────────────────────────
 
@@ -87,13 +92,33 @@ class SlotInferenceEngine:
             logger.warning("Feature drift detected in %d columns: %s", len(drifted), list(drifted.keys())[:5])
 
     def _prepare(self, features: pd.DataFrame) -> pd.DataFrame:
+        """
+        Prepare feature matrix for inference with comprehensive validation.
+        
+        Fixes:
+        - Adds missing features with default values (instead of raising error)
+        - Logs feature consistency check
+        - Removes zero-variance features if present
+        """
+        # Feature consistency check
         missing = [c for c in self.feature_columns if c not in features.columns]
+        extra = [c for c in features.columns if c not in self.feature_columns]
+        
         if missing:
-            raise ValueError(f"Missing feature columns: {missing[:10]}{'...' if len(missing) > 10 else ''}")
-
+            logger.warning(
+                f"Missing {len(missing)} features from input (will use defaults): {missing[:10]}{'...' if len(missing) > 10 else ''}"
+            )
+            # Add missing features with default value 0.0
+            for col in missing:
+                features[col] = 0.0
+        
+        if extra:
+            logger.debug(f"Ignoring {len(extra)} extra features not in model: {extra[:5]}")
+        
+        # Select and order features exactly as trained
         df = features[self.feature_columns].copy().fillna(0.0)
 
-        # Convert bool columns (e.g. slot_Morning=True) to float
+        # Convert bool/object columns to float
         for col in df.columns:
             if df[col].dtype == object or df[col].dtype == bool:
                 try:
